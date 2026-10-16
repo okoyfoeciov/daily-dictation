@@ -858,6 +858,46 @@ function getSessionById(sessionId) {
   return getAllSessionsDetailed().find((s) => s.sessionId === sessionId) || null;
 }
 
+/**
+ * Neighboring sessions' texts around `session`, same entry only — the extra
+ * context the explanation lookup sends to the LLM alongside the session
+ * itself. A one-sentence session alone often cannot fix a word's sense, so the
+ * client wraps the session in one valid session before and after it (when they
+ * exist) and marks which span the clicked word comes from; without the marks
+ * a word appearing both inside and outside the session would be ambiguous.
+ *
+ * Neighbors are the adjacent VALID sessions in partition order, so every line
+ * served here already passed isSessionValid. `radius` is sessions per side.
+ */
+function getSessionContext(session, radius = 1) {
+  const empty = { before: "", after: "" };
+  if (!session || !session.entryId || !session.sessionId) return empty;
+  const r = Math.max(0, Math.floor(Number(radius) || 0));
+  if (!r) return empty;
+  let entry = null;
+  try {
+    entry = db.getEntry(session.entryId);
+  } catch {
+    return empty;
+  }
+  if (!entry || !entry.transcriptPath) return empty;
+  const rec = sessionsForEntry(entry);
+  if (!rec || !Array.isArray(rec.sessions) || !rec.sessions.length) return empty;
+  const idx = rec.sessions.findIndex((s) => s.sessionId === session.sessionId);
+  if (idx < 0) return empty;
+  const before = rec.sessions
+    .slice(Math.max(0, idx - r), idx)
+    .map((s) => String(s.text || "").trim())
+    .filter(Boolean)
+    .join(" ");
+  const after = rec.sessions
+    .slice(idx + 1, idx + 1 + r)
+    .map((s) => String(s.text || "").trim())
+    .filter(Boolean)
+    .join(" ");
+  return { before, after };
+}
+
 // ---------------------------------------------------------------------------
 // Scheduling
 // ---------------------------------------------------------------------------
@@ -1429,5 +1469,6 @@ module.exports = {
   recordAttempt,
   getSessionWords,
   getSessionById,
+  getSessionContext,
   gradeDictation,
 };

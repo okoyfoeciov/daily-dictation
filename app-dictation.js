@@ -42,7 +42,7 @@
   const playerEl = document.getElementById("ln-player");
   const playBtn = document.getElementById("ln-play");
 
-  let currentSession = null; // {sessionId, entryId, entryTitle, start, end, duration, wordCount, reference, words}
+  let currentSession = null; // {sessionId, entryId, entryTitle, start, end, duration, wordCount, reference, words, contextBefore, contextAfter}
 
   // Monotonic stamp for the in-flight ensureDictationAudio load. A pending
   // 'loadedmetadata' seek is only valid for the load that armed it; pressing
@@ -409,6 +409,10 @@
         duration: Number(data.duration) || 0,
         wordCount: Number(data.wordCount) || 0,
         reference: String(data.reference || ""),
+        // Neighboring sessions' texts (same entry) for the explanation lookup:
+        // a one-sentence session alone often cannot fix a word's sense.
+        contextBefore: String(data.contextBefore || ""),
+        contextAfter: String(data.contextAfter || ""),
         wpm: Number(data.wpm) || 0,
         exhausted: !!data.exhausted,
         // Per-word ASR timings for this segment — the raw material for the A-B
@@ -820,6 +824,31 @@
   // mousedown → mousemove → mouseup like the right-button loop below,
   // rather than a click listener, so a drag and a click are distinguishable and
   // the drag can paint a live preview.
+  //
+  // The LLM gets more than the current 1-2 sentences: one neighboring session
+  // per side (same entry, served as contextBefore/contextAfter), because a
+  // short session alone often cannot fix a word's sense. The current session —
+  // where the click came from — is wrapped in >>> <<< so a word appearing both
+  // inside and outside it still resolves to the inside occurrence. With no
+  // neighbors the context is just the session itself (previous behaviour).
+  function buildExplainContext() {
+    const focus = String((currentSession && currentSession.reference) || "").trim();
+    const before = String((currentSession && currentSession.contextBefore) || "").trim();
+    const after = String((currentSession && currentSession.contextAfter) || "").trim();
+    if (!before && !after) return focus;
+    const lines = [
+      "Explain the chosen word(s) as used inside the >>> <<< marks. " +
+      "The lines outside the marks are neighboring sentences from the same episode, " +
+      "included only to fix the sense — when the same word appears inside and " +
+      "outside the marks, the inside occurrence is the one to explain.",
+      "",
+    ];
+    if (before) lines.push(before);
+    lines.push(`>>> ${focus} <<<`);
+    if (after) lines.push(after);
+    return lines.join("\n");
+  }
+
   function explainFromRange(a, b) {
     if (!dictRefEl) return;
     const lo = Math.min(a, b), hi = Math.max(a, b);
@@ -832,7 +861,7 @@
     }
     const phrase = parts.join(" ");
     if (!phrase) return;
-    const context = (currentSession && currentSession.reference) || "";
+    const context = buildExplainContext() || phrase;
     if (window.__dictationExplain) window.__dictationExplain(phrase, context);
   }
 

@@ -1312,7 +1312,10 @@
 
   // Exposed for dictation: trigger the same explanation panel from the
   // Reference line. `phrase` is the clicked word/phrase, `contextText`
-  // is the full sentence for the model's context window.
+  // is the surrounding passage for the model's context window: the current
+  // session wrapped in >>> <<< (the click came from inside the marks) plus
+  // one neighboring session per side outside them, with a header line saying
+  // so — or just the session itself when it has no neighbors.
   window.__dictationExplain = function(phrase, contextText) {
     if (!phrase || !String(phrase).trim()) return;
     const panel = nextPanelForSelection();

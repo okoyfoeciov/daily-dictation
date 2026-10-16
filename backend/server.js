@@ -112,6 +112,17 @@ app.get("/api/dictation/session", (req, res) => {
       });
     }
     const s = pick.session;
+    // Surrounding sessions' texts (same entry, one per side when they exist)
+    // so a word lookup can send the LLM more than the current 1-2 sentences.
+    // The client marks which span the click came from; never crossing entries.
+    let contextBefore = "", contextAfter = "";
+    try {
+      const ctx = dictation.getSessionContext(s, 1);
+      if (ctx) {
+        contextBefore = String(ctx.before || "");
+        contextAfter = String(ctx.after || "");
+      }
+    } catch {}
     res.json({
       sessionId: s.sessionId,
       entryId: s.entryId,
@@ -129,6 +140,8 @@ app.get("/api/dictation/session", (req, res) => {
       // *after* checking — the grading itself is server-side on /api/dictation/check,
       // so a client that peeks early gains nothing.
       reference: s.text,
+      contextBefore,
+      contextAfter,
       exhausted: pick.exhausted,
       stats: {
         total: pick.total,
