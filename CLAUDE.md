@@ -64,7 +64,9 @@ legacy `pbs-sync.log` (from when the sync ran from cron) is untracked by omissio
 A dictation-only Electron desktop app: daily dictation sessions cut from PBS
 NewsHour segments (audio-only, 1–2 sentences per session, looped), with
 WER-based grading, SM-2 spaced scheduling, and click-a-word AI explanations.
-The corpus lives under `library/collections/pbs-newshour*`, with media in
+The corpus is every entry under a source's show collection
+(`library/collections/pbs-newshour*` — the source list lives in
+`backend/sources.js`), with media in
 `library/movies/*` (the older mp4 corpus) and `library/audios/*` (the RSS
 audio imports), and the only media route is
 `GET /api/library/:id/stream`, which serves the segment audio the dictation
@@ -81,10 +83,18 @@ loopback; library lives in `<repo>/library` in dev, `<userData>/library`
 packaged — see `backend/paths.js`). `backend/dictation.js` holds the session-partition algorithm, the scheduler,
 and the WER grader. `backend/pbs-sync.js` is the catch-up sync: the embedded
 backend runs it on app launch and every few hours, pulling new PBS segments
-from the segments RSS audio with verbatim transcription via ai-service
+from the segments podcast RSS audio (`backend/sources.js`) with verbatim
+transcription via ai-service
 (`backend/transcribe.js` → `POST 127.0.0.1:8770/api/transcribe-verbatim`,
 Azure MAI-Transcribe-2 under the hood — this app holds no Azure credentials),
-repairing broken transcripts, and pruning days past `KEEP_DAYS` (3).
+repairing broken transcripts. It keeps one broadcast day (`KEEP_DAYS` = 1): the
+newest weekday in the feed, with all of that episode's segments. Today's
+episode once it is out, otherwise the last one aired, so Saturday and Sunday
+keep Friday's; older days and weekend days are pruned, but only once the kept
+day has a readable transcript and this run imported all of it. The segments
+feed also carries "Settle In" podcast episodes (guid under
+`/newshour/podcasts/`); `sources.js` drops them, since they are not part of the
+NewsHour episode. Preview a run with `node backend/pbs-sync.js --dry-run`.
 `main.js` is the Electron shell. Avoid changing `app-player.js`'s explanation
 engine unless the task requires it.
 

@@ -246,6 +246,7 @@ async function runSyncCheck() {
       imported: r.imported || 0,
       repaired: r.repaired || 0,
       failed: r.failed || 0,
+      feedFailures: r.feedFailures || 0,
       current: 0, total: 0, title: "",
     };
   } catch (e) {

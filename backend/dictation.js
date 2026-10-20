@@ -55,6 +55,7 @@ const fs = require("fs");
 const path = require("path");
 const db = require("./db");
 const paths = require("./paths");
+const { sourceOf } = require("./sources");
 
 // Resolved per call (not a captured constant) so a setLibraryDir() call from
 // the packaged app takes effect without re-requiring this module.
@@ -740,28 +741,17 @@ function isSessionValid(s) {
 // Corpus
 // ---------------------------------------------------------------------------
 
-function getPBSEntries() {
+function getCorpusEntries() {
   const all = db.listEntries();
   const byId = new Map(all.map((e) => [e.id, e]));
 
-  // Membership is decided by the collection tree. sourceId is not evidence of
-  // it — it only says the entry came from somewhere with an id, which is true of
-  // every imported file. The walk is depth-capped because a cyclic parentId
-  // would otherwise spin forever inside a request and hang the server.
-  function isUnderPBS(e) {
-    let cur = e;
-    for (let hops = 0; cur && hops < 32; hops++) {
-      if (cur.id === "pbs-newshour" || cur.parentId === "pbs-newshour") return true;
-      if (!cur.parentId) return false;
-      cur = byId.get(cur.parentId);
-    }
-    return false;
-  }
-
+  // Membership is decided by the collection tree (see sourceOf in sources.js):
+  // an entry is in the corpus when it sits under one of the audio sources.
+  //
   // "movie" is the older mp4 corpus, "audio" the RSS podcast imports — the
   // dictation loop only ever plays the sound track either way.
   return all.filter(
-    (e) => (e.type === "movie" || e.type === "audio") && isUnderPBS(e) && e.transcriptStatus === "ready" && e.transcriptPath,
+    (e) => (e.type === "movie" || e.type === "audio") && sourceOf(e, byId) && e.transcriptStatus === "ready" && e.transcriptPath,
   );
 }
 
@@ -821,7 +811,7 @@ function sessionsForEntry(entry) {
 
 function getAllSessionsDetailed() {
   const out = [];
-  for (const e of getPBSEntries()) {
+  for (const e of getCorpusEntries()) {
     const rec = sessionsForEntry(e);
     if (!rec) continue;
     // A transcript this badly damaged is excluded wholesale: its surviving

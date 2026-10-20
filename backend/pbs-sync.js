@@ -1,24 +1,27 @@
 "use strict";
 
-// Catch-up sync: pulls new PBS NewsHour segments into the library, grouped
-// under a "PBS NewsHour" collection by day.
+// Catch-up sync: pulls new episodes from each audio source in backend/sources.js
+// (PBS NewsHour segments) into the library, grouped under one collection per
+// show and then by day.
 //
 // Called by the embedded backend (backend/server.js) on app launch and every
 // few hours while the app runs; also runnable standalone for debugging:
 //
-//   node backend/pbs-sync.js [--dry-run] [--limit=N]
+//   node backend/pbs-sync.js [--dry-run] [--limit=N] [--source=id[,id]]
 //
-// Source: PBS's own segments RSS. It is the authoritative list of what is a
-// real segment (title + publish date) and every item carries a direct audio
+// Source: each show's own podcast RSS. It is the authoritative list of what is
+// a real episode (title + publish date) and every item carries a direct audio
 // download link (the podcast file). Dictation only ever plays audio, so the
 // RSS audio is the whole pipeline — no YouTube, no yt-dlp, no matching
 // against a video feed that only carries the last ~15 uploads.
 //
-// Missing = an RSS item with no library entry under the same normalized
-// title (or sourceId). Newest day first, so today's episode lands first and
-// older gaps backfill behind it. Broken transcripts (interrupted writes,
+// Missing =an RSS item, from the newest weekday broadcast day only (KEEP_DAYS),
+// with no library entry under the same normalized title (or sourceId). A day is
+// the whole episode with all its segments. On a weekend, or before today's
+// episode is out, the newest weekday in the feed is the last one aired, so
+// Saturday and Sunday keep Friday's. Broken transcripts (interrupted writes,
 // failed jobs) are re-transcribed from their media file in the same pass.
-// Days beyond KEEP_DAYS are pruned (entries + files).
+// Days beyond KEEP_DAYS, and weekend days, are pruned (entries + files).
 //
 // Single-flight: a heartbeat lock in the library directory keeps a manual
 // CLI run and the app's own check from overlapping.
@@ -30,28 +33,27 @@ const db = require("./db");
 const paths = require("./paths");
 const { importMedia, createCollection, slugify } = require("./import");
 const { transcribeVerbatim } = require("./transcribe");
+const { SOURCES, sourceOf } = require("./sources");
 
-const PBS_SEGMENTS_RSS = "https://www.pbs.org/newshour/feeds/rss/podcasts/segments";
-const SHOW_ID = "pbs-newshour";
-const SHOW_TITLE = "PBS NewsHour";
-
-// How many broadcast days of segments to keep before pruning.
+// How many weekday broadcast days of episodes to keep, per source: the newest
+// one. Saturday and Sunday are not broadcast days here, so over a weekend the
+// newest is Friday.
 //
-// This number is coupled to the dictation scheduler — do not lower it without
-// reading backend/dictation.js's applyAttemptSchedule. Dictation items are keyed
-// to these entries, so pruning a day deletes the sessions cut from it and
-// orphans every attempt logged against them.
+// This number is coupled to the dictation scheduler (backend/dictation.js's
+// applyAttemptSchedule). Dictation items are keyed to these entries, so
+// pruning a day deletes the sessions cut from it and orphans every attempt
+// logged against them.
 //
 // An item retires after three spaced passes, at SM-2 intervals of 1 then 6 days,
-// so the fastest possible path from first exposure to retirement is 7 days.
-// Failures requeue in 20 minutes; what actually stretches the window is
-// practising irregularly, which is the normal case. 3 keeps the first-run
-// backlog small (~6 segments, cents on Azure) at the cost of that margin:
-// items still due past day 3 are pruned with their history, so irregular
-// practicers re-meet material as unseen instead of as scheduled reviews —
-// and a mastered item never needs its audio again, which is why a small
-// number works and no permanent archive is needed.
-const KEEP_DAYS = 3;
+// so the fastest possible path from first exposure to retirement is 7 days. With
+// one day kept that path is closed: the 20-minute requeue after a failed
+// attempt works, and so can the 1-day review if the next episode is not out yet,
+// but the 6-day one never does — its session is pruned when the next episode
+// lands. So nothing retires, and the history of an unfinished item goes with its
+// session. What it buys is a small backlog (one episode, so a first run
+// transcribes only that) and every session being fresh news. A mastered item
+// never needs its audio again, so no permanent archive is kept.
+const KEEP_DAYS = 1;
 
 // A run heartbeats the lock before every item; a lock whose owner is gone, or
 // that is older than this, belongs to a dead run and can be taken over.
@@ -85,9 +87,9 @@ function extractTag(block, tag) {
   return decodeEntities(text.trim());
 }
 
-// PBS's segments RSS (RSS 2.0): title + pubDate + audio enclosure per <item>.
-// The enclosure is the segment's own audio, which is all dictation needs.
-function parseSegmentsRss(xml) {
+// A podcast RSS 2.0 feed: title + pubDate + audio enclosure per <item>. The
+// enclosure is the episode's own audio, which is all dictation needs.
+function parseRssItems(xml) {
   const items = [];
   const itemRe = /<item>([\s\S]*?)<\/item>/g;
   let m;
@@ -96,13 +98,14 @@ function parseSegmentsRss(xml) {
     const title = extractTag(block, "title");
     const pubDate = extractTag(block, "pubDate");
     const guid = extractTag(block, "guid") || "";
-    const enc = block.match(/<enclosure[^>]*url="([^"]+)"/);
+    const encTag = (block.match(/<enclosure\b[^>]*>/) || [""])[0];
+    const encUrl = encTag.match(/\burl="([^"]+)"/);
     if (title && pubDate) {
       items.push({
         title,
         pubDate,
         guid,
-        enclosure: enc ? decodeEntities(enc[1]) : "",
+        enclosure: encUrl ? decodeEntities(encUrl[1]) : "",
       });
     }
   }
@@ -118,42 +121,61 @@ function normalizeTitle(t) {
     .trim();
 }
 
-// Groups by the RSS item's own pubDate (PBS's editorial day), not by when we
-// fetched it, so a segment lands under the broadcast day it belongs to. Both
-// dateId and title are derived from the same UTC calendar day — forcing UTC on
-// the title too (not just dateId's toISOString) keeps them from disagreeing on
-// a machine whose local timezone is far from PBS's US Eastern time.
-function dayInfoFromPubDate(pubDate) {
+// Groups by the RSS item's own pubDate (the show's editorial day), not by when
+// we fetched it, so an episode lands under the broadcast day it belongs to. Both
+// dateId and title are derived from the same calendar day in the source's own
+// time zone (sources.js dayTz) — forcing it on the title too, not just the id,
+// keeps them from disagreeing on a machine whose local timezone is far from it.
+function dayInfoFromPubDate(pubDate, tz = "UTC") {
   const d = new Date(pubDate);
   if (isNaN(d.getTime())) return null;
-  const dateId = d.toISOString().slice(0, 10);
-  const title = d.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric", timeZone: "UTC" });
+  // en-CA formats a date as YYYY-MM-DD.
+  const dateId = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+  const title = d.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric", timeZone: tz });
   return { dateId, title };
 }
 
-// Downloads the segment audio to a fresh temp dir (caller must remove it) and
+// Downloads the episode audio to a fresh temp dir (caller must remove it) and
 // returns the path to the file.
-async function downloadEnclosure(url, title) {
-  const res = await fetch(url, { signal: AbortSignal.timeout(ENCLOSURE_TIMEOUT_MS) });
+async function downloadEnclosure(item) {
+  const res = await fetch(item.enclosure, { signal: AbortSignal.timeout(ENCLOSURE_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`GET enclosure -> HTTP ${res.status}`);
   const ct = res.headers.get("content-type") || "";
   if (ct.includes("text/html")) throw new Error("enclosure returned an HTML page, not audio");
   const buf = Buffer.from(await res.arrayBuffer());
   if (!buf.length) throw new Error("enclosure came back empty");
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pbs-sync-"));
-  const filePath = path.join(tmpDir, `${slugify(title)}.mp3`);
+  const filePath = path.join(tmpDir, `${slugify(item.entryTitle)}.mp3`);
   fs.writeFileSync(filePath, buf);
   return { dir: tmpDir, filePath };
 }
 
-// Day ids are "<SHOW_ID>-YYYY-MM-DD", which sorts correctly as plain strings —
-// no separate stored date field needed. Returns how many days were pruned.
-function pruneOldDays() {
+// Monday to Friday, for a "YYYY-MM-DD" day id. Read from the date string itself
+// rather than a local-time Date, so it is the broadcast day's own weekday on a
+// machine in any time zone.
+function isWeekday(dateId) {
+  const dow = new Date(`${dateId}T12:00:00Z`).getUTCDay();
+  return dow >= 1 && dow <= 5;
+}
+
+// Day ids are "<show id>-YYYY-MM-DD", which sorts correctly as plain strings —
+// no separate stored date field needed. Keeps the newest KEEP_DAYS weekday days
+// of that show; every other day goes, a weekend day left by an older library
+// included (it would otherwise outrank Friday). A child collection whose id has
+// no date is not a day and is left alone. Returns how many days of that show
+// were pruned.
+function pruneOldDays(showId) {
   let pruned = 0;
-  const days = db.listChildren(SHOW_ID)
-    .filter((e) => e.type === "collection")
+  const days = db.listChildren(showId)
+    .filter((e) => e.type === "collection" && /-\d{4}-\d{2}-\d{2}$/.test(e.id))
     .sort((a, b) => b.id.localeCompare(a.id));
-  for (const day of days.slice(KEEP_DAYS)) {
+  const keep = new Set(days.filter((e) => isWeekday(e.id.slice(-10))).slice(0, KEEP_DAYS).map((e) => e.id));
+  // The older days are the only usable material until a kept day has a readable
+  // transcript of its own. With none (a transcription outage, a day of nothing
+  // but errors) they stay, and a later run prunes them once the repair pass has
+  // made the kept day usable.
+  if (![...keep].some((id) => db.listChildren(id).some(transcriptIsReadable))) return 0;
+  for (const day of days.filter((e) => !keep.has(e.id))) {
     for (const seg of db.listChildren(day.id)) {
       if (seg.dir) fs.rmSync(seg.dir, { recursive: true, force: true });
       db.deleteEntry(seg.id);
@@ -230,19 +252,21 @@ async function repairEntry(entry) {
   }
 }
 
+// The day collection is created only once the download has succeeded: an empty
+// day left behind by a failed download would still count toward KEEP_DAYS and
+// push a good day out of the library.
 async function importOne(item) {
-  const dayInfo = dayInfoFromPubDate(item.pubDate);
-  if (!dayInfo) throw new Error(`unparseable pubDate "${item.pubDate}"`);
-  const dayId = `${SHOW_ID}-${dayInfo.dateId}`;
-  if (!db.getEntry(dayId)) {
-    await createCollection({ title: dayInfo.title, id: dayId, parentId: SHOW_ID });
-    console.log(`Created day entry "${dayId}".`);
-  }
-  const { dir, filePath } = await downloadEnclosure(item.enclosure, item.title);
+  const { src, day } = item;
+  const dayId = `${src.id}-${day.dateId}`;
+  const { dir, filePath } = await downloadEnclosure(item);
   try {
-    const entry = await importMedia({ sourcePath: filePath, type: "audio", title: item.title, parentId: dayId });
+    if (!db.getEntry(dayId)) {
+      await createCollection({ title: day.title, id: dayId, parentId: src.id });
+      console.log(`Created day entry "${dayId}".`);
+    }
+    const entry = await importMedia({ sourcePath: filePath, type: "audio", title: item.entryTitle, parentId: dayId });
     db.upsertEntry({ id: entry.id, sourceId: item.guid || item.enclosure });
-    console.log(`Imported "${item.title}" as "${entry.id}".`);
+    console.log(`Imported "${item.entryTitle}" as "${entry.id}".`);
     return entry;
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -252,49 +276,85 @@ async function importOne(item) {
 // ---------------------------------------------------------------------------
 // sync()
 //
-// Returns { locked, missing, repairs, imported, repaired, failed, pruned }.
+// Returns { locked, missing, repairs, imported, repaired, failed, feedFailures,
+// pruned }; feedFailures counts the sources whose feed could not be read (also
+// in failed). If every feed fails the run throws instead.
 // onProgress receives { phase, current, total, title } with phases "fetch",
-// "importing", "repairing", "prune", "done".
+// "importing", "repairing", "prune", "done". `sources` limits the run to those
+// source ids (default: all of backend/sources.js).
 // ---------------------------------------------------------------------------
-async function sync({ onProgress = () => {}, dryRun = false, limit = Infinity } = {}) {
+async function sync({ onProgress = () => {}, dryRun = false, limit = Infinity, sources: onlyIds = null } = {}) {
   const report = (p) => {
     heartbeatLock();
     try { onProgress(p); } catch { /* a broken listener must not stop the run */ }
   };
 
+  const wanted = onlyIds && onlyIds.length ? SOURCES.filter((s) => onlyIds.includes(s.id)) : SOURCES;
+  if (!wanted.length) throw new Error(`pbs-sync: unknown source(s): ${onlyIds.join(", ")}`);
+
   if (!dryRun && !acquireLock()) {
     console.log("pbs-sync: another run is already in progress — skipping.");
-    return { locked: true, missing: 0, repairs: 0, imported: 0, repaired: 0, failed: 0, pruned: 0 };
+    return { locked: true, missing: 0, repairs: 0, imported: 0, repaired: 0, failed: 0, feedFailures: 0, pruned: 0 };
   }
 
   try {
     report({ phase: "fetch" });
-    console.log("Fetching PBS segments RSS...");
-    const rss = parseSegmentsRss(await fetchText(PBS_SEGMENTS_RSS));
-    console.log(`  ${rss.length} item(s) in the segments RSS.`);
 
     const known = new Set();
     const titles = new Set();
     const allEntries = db.listEntries();
+    const byId = new Map(allEntries.map((e) => [e.id, e]));
     for (const e of allEntries) {
       if (e.sourceId) known.add(e.sourceId);
       if (e.type !== "collection") titles.add(normalizeTitle(e.title || ""));
     }
 
-    const cutoff = Date.now() - KEEP_DAYS * 864e5;
     const missing = [];
-    for (const it of rss) {
-      if (!it.enclosure) continue;
-      const when = new Date(it.pubDate).getTime();
-      if (isNaN(when) || when < cutoff) continue;   // older than we keep: never refetch
-      if (known.has(it.guid) || known.has(it.enclosure) || titles.has(normalizeTitle(it.title))) continue;
-      missing.push({ ...it, when });
+    // One source's feed being down must not stop the others.
+    let feedFailures = 0;
+    let firstFeedError = null;
+    for (const src of wanted) {
+      console.log(`Fetching ${src.title} RSS...`);
+      let rss;
+      try {
+        rss = parseRssItems(await fetchText(src.rssUrl));
+      } catch (err) {
+        feedFailures++;
+        firstFeedError = firstFeedError || err;
+        console.error(`  ${src.title}: could not read the feed: ${err.message}`);
+        continue;
+      }
+      console.log(`  ${rss.length} item(s) in the ${src.title} RSS.`);
+      // The wanted day is the newest weekday in the feed — today's episode once
+      // it is out, otherwise the last one aired (Friday's all weekend). It is
+      // picked first and then each item tested against it, because a day is
+      // several items (PBS publishes an episode as separate segments).
+      const candidates = [];
+      for (const it of rss) {
+        if (!it.enclosure || !src.keep(it)) continue;
+        const day = dayInfoFromPubDate(it.pubDate, src.dayTz);
+        if (day && isWeekday(day.dateId)) candidates.push({ it, day });
+      }
+      const wantedDays = new Set([...new Set(candidates.map((c) => c.day.dateId))].sort().reverse().slice(0, KEEP_DAYS));
+      for (const { it, day } of candidates) {
+        if (!wantedDays.has(day.dateId)) continue;   // older than we keep: never refetch
+        const entryTitle = src.entryTitle(it, day);
+        if (known.has(it.guid) || known.has(it.enclosure) || titles.has(normalizeTitle(entryTitle))) continue;
+        missing.push({ ...it, src, day, entryTitle, when: new Date(it.pubDate).getTime() });
+      }
     }
+    if (feedFailures === wanted.length) throw firstFeedError;   // nothing to work with
     missing.sort((a, b) => b.when - a.when);   // newest day first
 
+    // A run limited to some sources repairs only their entries.
+    const wantedIds = new Set(wanted.map((s) => s.id));
     const repairs = [];
     for (const e of allEntries) {
       if (e.type === "collection") continue;
+      if (onlyIds) {
+        const owner = sourceOf(e, byId);
+        if (!owner || !wantedIds.has(owner.id)) continue;
+      }
       if (transcriptIsReadable(e)) continue;
       if (e.filePath && fs.existsSync(e.filePath)) repairs.push(e);
       else console.warn(`pbs-sync: no media file for "${e.id}" — cannot repair.`);
@@ -303,28 +363,38 @@ async function sync({ onProgress = () => {}, dryRun = false, limit = Infinity } 
     console.log(`  ${missing.length} missing, ${repairs.length} to repair.`);
 
     if (dryRun) {
-      for (const it of missing) console.log(`  would import "${it.title}" (${it.pubDate})`);
+      for (const it of missing) console.log(`  would import "${it.entryTitle}" (${it.pubDate}) [${it.src.id}]`);
       for (const e of repairs) console.log(`  would repair "${e.id}"`);
-      console.log("Dry run — nothing downloaded, transcribed, or written to the library.");
-      return { locked: false, missing: missing.length, repairs: repairs.length, imported: 0, repaired: 0, failed: 0, pruned: 0 };
+      console.log("Dry run — nothing transcribed or written to the library.");
+      return { locked: false, missing: missing.length, repairs: repairs.length, imported: 0, repaired: 0, failed: feedFailures, feedFailures, pruned: 0 };
     }
 
-    if (missing.length && !db.getEntry(SHOW_ID)) {
-      await createCollection({ title: SHOW_TITLE, id: SHOW_ID });
-      console.log(`Created show entry "${SHOW_ID}".`);
+    for (const src of new Set(missing.map((m) => m.src))) {
+      if (!db.getEntry(src.id)) {
+        await createCollection({ title: src.title, id: src.id });
+        console.log(`Created show entry "${src.id}".`);
+      }
     }
 
-    let imported = 0, repaired = 0, failed = 0;
+    let imported = 0, repaired = 0, failed = feedFailures;
+    // Sources whose newest day this run did not finish (an import failed, or
+    // `limit` cut items off): the older day it would replace stays for now.
+    const unfinished = new Set(missing.slice(limit).map((m) => m.src.id));
     const toImport = missing.slice(0, limit);
     for (let i = 0; i < toImport.length; i++) {
-      report({ phase: "importing", current: i + 1, total: toImport.length, title: toImport[i].title });
+      // Two items can share a title (the feed re-issuing a broadcast under a new
+      // guid). The first to import wins; a later one is tried only if the
+      // earlier failed, and never overwrites an entry.
+      if (titles.has(normalizeTitle(toImport[i].entryTitle))) continue;
+      report({ phase: "importing", current: i + 1, total: toImport.length, title: toImport[i].entryTitle });
       try {
         await importOne(toImport[i]);
         imported++;
-        titles.add(normalizeTitle(toImport[i].title));
+        titles.add(normalizeTitle(toImport[i].entryTitle));
       } catch (err) {
         failed++;
-        console.error(`  failed to import "${toImport[i].title}": ${err.message}`);
+        unfinished.add(toImport[i].src.id);
+        console.error(`  failed to import "${toImport[i].entryTitle}": ${err.message}`);
       }
     }
 
@@ -341,9 +411,16 @@ async function sync({ onProgress = () => {}, dryRun = false, limit = Infinity } 
     }
 
     report({ phase: "prune" });
-    const pruned = pruneOldDays();
+    let pruned = 0;
+    for (const src of wanted) {
+      if (unfinished.has(src.id)) {
+        console.log(`  ${src.title}: its newest day is not fully imported — keeping the older day for now.`);
+        continue;
+      }
+      pruned += pruneOldDays(src.id);
+    }
     report({ phase: "done", imported, repaired, failed, pruned });
-    return { locked: false, missing: missing.length, repairs: repairs.length, imported, repaired, failed, pruned };
+    return { locked: false, missing: missing.length, repairs: repairs.length, imported, repaired, failed, feedFailures, pruned };
   } finally {
     if (!dryRun) releaseLock();
   }
@@ -354,7 +431,9 @@ if (require.main === module) {
   const dryRun = args.includes("--dry-run");
   const limitArg = args.find((a) => a.startsWith("--limit="));
   const limit = limitArg ? Number(limitArg.split("=")[1]) || Infinity : Infinity;
-  sync({ dryRun, limit })
+  const sourceArg = args.find((a) => a.startsWith("--source="));
+  const sources = sourceArg ? sourceArg.split("=")[1].split(",").filter(Boolean) : null;
+  sync({ dryRun, limit, sources })
     .then((r) => console.log("sync result:", JSON.stringify(r)))
     .catch((err) => {
       console.error(err);

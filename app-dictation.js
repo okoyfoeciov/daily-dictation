@@ -230,6 +230,12 @@
       if (s.repaired) bits.push(`repaired ${s.repaired}`);
       // Keep the result on screen for a beat after the run finishes.
       if (bits.length && Date.now() - (s.at || 0) < 12000) text = bits.join(" · ");
+      // A source whose feed could not be read stays on screen until a run reads
+      // it, so a dead feed is not hidden behind the other source's good run.
+      if (s.feedFailures) {
+        const n = s.feedFailures;
+        text = (text ? text + " · " : "") + `${n} source${n === 1 ? "" : "s"} unreachable — will retry`;
+      }
     } else if (s.state === "error") {
       text = "New-episode check failed — will retry";
     }
