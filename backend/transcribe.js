@@ -12,13 +12,28 @@
 //                          pbs-sync, since the dictation checker scores against
 //                          the verbatim reference.
 //
+// What is uploaded is one short random clip per segment (see backend/clip.js),
+// not the whole segment, so a response's timings are in clip time and the
+// caller shifts them back to file time.
+//
 // This app holds no Azure credentials at all: the key lives in ai-service's
 // own ai-service.env and the model call happens over there. The response
 // already carries this repo's shape { lines, words }, so what comes back is
 // validated and returned as-is.
 //
 // Error bodies are ai-service's own shape ({error: "..."}), since nothing
-// here renders to a browser.
+// here renders to a browser. Failures are classified for the caller:
+//   - `err.permanent` — no transcript, or an Azure 4xx that is not auth,
+//     timeout or rate limiting. Retrying cannot succeed, so the entry gives up
+//     at once instead of burning attempts.
+//   - `err.free` — ai-service itself is not running (ECONNREFUSED), so Azure
+//     was never called. The caller does not count this toward its 3-attempt
+//     cap.
+// Everything else (5xx, 401/403/408/429, unreachable Azure, unparseable JSON,
+// timeouts) keeps the in-call retry below.
+//
+// onTry({ status, error, ms }) fires once per HTTP request, including each
+// failed try, for the usage log in backend/import.js.
 //
 // No result cache here: every transcript produced is persisted permanently at
 // library/<type>s/<slug>/transcript.json, so a second content-addressed cache
@@ -50,6 +65,39 @@ function retryable(status) {
   return !status || status >= 500 || status === 409 || status === 429;
 }
 
+// ai-service expresses Azure failures as HTTP 502 with the upstream status in
+// `azureStatus`. A no-transcript result and an Azure 4xx (other than auth,
+// timeout and rate limiting) can never succeed by repeating the same upload.
+function permanentFailure(body) {
+  if (!body) return null;
+  if (body.error === "azure returned no transcript") return "azure returned no transcript";
+  const azureStatus = Number(body.azureStatus);
+  if (
+    body.azureStatus != null &&
+    Number.isFinite(azureStatus) &&
+    azureStatus >= 400 && azureStatus < 500 &&
+    ![401, 403, 408, 429].includes(azureStatus)
+  ) {
+    return `azureStatus ${azureStatus}`;
+  }
+  return null;
+}
+
+// Only ECONNREFUSED proves the request never reached Azure. Anything else may
+// have been billed somewhere, so it keeps the normal retry/attempt accounting.
+function connectionRefused(err) {
+  for (let cur = err; cur; cur = cur.cause) {
+    if (cur.code === "ECONNREFUSED") return true;
+  }
+  return /ECONNREFUSED/.test(String((err && err.message) || ""));
+}
+
+function reportTry(onTry, info) {
+  try {
+    onTry(info);
+  } catch { /* a broken logger must not break transcription */ }
+}
+
 function validShape(t) {
   return (
     t &&
@@ -68,7 +116,7 @@ function validShape(t) {
 // /api/transcribe-verbatim. A single-shot synchronous multipart POST: PBS
 // clips fit the 300 MB cap, so there is no chunked upload protocol and no
 // polling loop.
-async function transcribeVerbatim(filePath, { onProgress = () => {} } = {}) {
+async function transcribeVerbatim(filePath, { onProgress = () => {}, onTry = () => {} } = {}) {
   const size = statSync(filePath).size;
   if (size > TX_MAX) throw new Error("File is too large to transcribe (over 300 MB).");
   onProgress("uploading to ai-service (verbatim)...");
@@ -78,7 +126,9 @@ async function transcribeVerbatim(filePath, { onProgress = () => {} } = {}) {
   onProgress("waiting for verbatim transcription...");
   let lastErr = null;
   for (let attempt = 0; attempt < TX_RETRIES; attempt++) {
+    const started = Date.now();
     let res = null;
+    let fetchErr = null;
     try {
       res = await fetch(`${AI_SERVICE_URL}/api/transcribe-verbatim`, {
         method: "POST",
@@ -86,16 +136,45 @@ async function transcribeVerbatim(filePath, { onProgress = () => {} } = {}) {
         signal: AbortSignal.timeout(TX_TIMEOUT_MS),
       });
     } catch (e) {
-      lastErr = e;
+      fetchErr = e;
+    }
+
+    let j = null;
+    if (res) {
+      try { j = await res.json(); } catch { /* non-JSON error body */ }
+    }
+    const status = res ? res.status : null;
+    const httpError = res && !res.ok
+      ? ((j && j.error) || `transcribe-verbatim ${res.status}`)
+      : null;
+    reportTry(onTry, {
+      status,
+      error: fetchErr ? String(fetchErr.message || fetchErr) : httpError,
+      ms: Date.now() - started,
+    });
+
+    if (fetchErr) {
+      lastErr = fetchErr;
+      if (connectionRefused(fetchErr)) {
+        // ai-service is not running: no Azure call happened, so this try is
+        // free and the next sync can retry without touching the cap.
+        fetchErr.free = true;
+        throw fetchErr;
+      }
       onProgress(`retrying after network error (${attempt + 1}/${TX_RETRIES})...`);
       await sleep(2000 * (attempt + 1));
       continue;
     }
-    let j = null;
-    try { j = await res.json(); } catch { /* non-JSON error body */ }
+
     if (!res.ok) {
-      const err = new Error((j && j.error) || `transcribe-verbatim ${res.status}`);
+      const err = new Error(httpError);
       err.status = res.status;
+      const permanent = permanentFailure(j);
+      if (permanent) {
+        err.permanent = true;
+        err.permanentReason = permanent;
+        throw err;
+      }
       if (!retryable(res.status) || attempt === TX_RETRIES - 1) throw err;
       lastErr = err;
       onProgress(`retrying after status ${res.status} (${attempt + 1}/${TX_RETRIES})...`);

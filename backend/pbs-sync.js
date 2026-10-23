@@ -23,6 +23,15 @@
 // failed jobs) are re-transcribed from their media file in the same pass.
 // Days beyond KEEP_DAYS, and weekend days, are pruned (entries + files).
 //
+// STT is paid by the second, so each segment is sent as one random short clip
+// (50 s for a Monday–Thursday episode, 100 s for Friday's), not whole; see
+// backend/clip.js. The clip is saved on the entry before the call, and a repair
+// re-sends exactly the same bytes. An entry gets three attempts: a failure that
+// cannot succeed (Azure's "no transcript", or a 4xx other than 401/403/408/429)
+// gives up after one, and an ai-service that is not running is free and does not
+// count. `sttGaveUp` stops the repair pass from paying again; every HTTP
+// request is appended to library/stt-usage.jsonl by backend/import.js.
+//
 // Single-flight: a heartbeat lock in the library directory keeps a manual
 // CLI run and the app's own check from overlapping.
 
@@ -31,8 +40,7 @@ const os = require("os");
 const path = require("path");
 const db = require("./db");
 const paths = require("./paths");
-const { importMedia, createCollection, slugify } = require("./import");
-const { transcribeVerbatim } = require("./transcribe");
+const { importMedia, createCollection, transcribeEntry, slugify } = require("./import");
 const { SOURCES, sourceOf } = require("./sources");
 
 // How many weekday broadcast days of episodes to keep, per source: the newest
@@ -238,18 +246,10 @@ function transcriptIsReadable(entry) {
 }
 
 async function repairEntry(entry) {
-  const transcriptPath = entry.transcriptPath || path.join(entry.dir, "transcript.json");
-  db.upsertEntry({ id: entry.id, transcriptStatus: "processing", transcriptPath });
-  try {
-    const transcript = await transcribeVerbatim(entry.filePath, {
-      onProgress: (msg) => console.log(`  [repair ${entry.id}] ${msg}`),
-    });
-    fs.writeFileSync(transcriptPath, JSON.stringify(transcript));
-    db.upsertEntry({ id: entry.id, transcriptStatus: "ready", transcriptPath });
-  } catch (err) {
-    db.upsertEntry({ id: entry.id, transcriptStatus: "error", transcriptPath });
-    throw err;
-  }
+  return transcribeEntry(entry, {
+    purpose: "repair",
+    onProgress: (msg) => console.log(`  [repair ${entry.id}] ${msg}`),
+  });
 }
 
 // The day collection is created only once the download has succeeded: an empty
@@ -264,7 +264,13 @@ async function importOne(item) {
       await createCollection({ title: day.title, id: dayId, parentId: src.id });
       console.log(`Created day entry "${dayId}".`);
     }
-    const entry = await importMedia({ sourcePath: filePath, type: "audio", title: item.entryTitle, parentId: dayId });
+    const entry = await importMedia({
+      sourcePath: filePath,
+      type: "audio",
+      title: item.entryTitle,
+      parentId: dayId,
+      dateId: day.dateId,
+    });
     db.upsertEntry({ id: entry.id, sourceId: item.guid || item.enclosure });
     console.log(`Imported "${item.entryTitle}" as "${entry.id}".`);
     return entry;
@@ -356,6 +362,10 @@ async function sync({ onProgress = () => {}, dryRun = false, limit = Infinity, s
         if (!owner || !wantedIds.has(owner.id)) continue;
       }
       if (transcriptIsReadable(e)) continue;
+      if (e.sttGaveUp) {
+        console.log(`pbs-sync: not re-sending "${e.id}": gave up (${e.sttGiveUpReason || "unknown"})`);
+        continue;
+      }
       if (e.filePath && fs.existsSync(e.filePath)) repairs.push(e);
       else console.warn(`pbs-sync: no media file for "${e.id}" — cannot repair.`);
     }
@@ -401,9 +411,13 @@ async function sync({ onProgress = () => {}, dryRun = false, limit = Infinity, s
     for (let i = 0; i < repairs.length; i++) {
       report({ phase: "repairing", current: i + 1, total: repairs.length, title: repairs[i].title || repairs[i].id });
       try {
-        await repairEntry(repairs[i]);
-        repaired++;
-        console.log(`Repaired "${repairs[i].id}".`);
+        const result = await repairEntry(repairs[i]);
+        if (result && result.sttGaveUp) {
+          console.log(`Gave up on "${repairs[i].id}" (${result.sttGiveUpReason || "unknown"}).`);
+        } else {
+          repaired++;
+          console.log(`Repaired "${repairs[i].id}".`);
+        }
       } catch (err) {
         failed++;
         console.error(`  failed to repair "${repairs[i].id}": ${err.message}`);

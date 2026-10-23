@@ -768,9 +768,11 @@ function sessionsForEntry(entry) {
   if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit;
 
   let words;
+  let partial = false;
   try {
     const data = JSON.parse(fs.readFileSync(entry.transcriptPath, "utf8"));
     words = Array.isArray(data.words) ? data.words : [];
+    partial = !!data.clip;
   } catch (e) {
     console.warn(`dictation: unreadable transcript for ${entry.id}: ${e.message}`);
     return null;
@@ -785,6 +787,7 @@ function sessionsForEntry(entry) {
     mtimeMs: stat.mtimeMs,
     size: stat.size,
     words,
+    partial,
     candidates: candidates.length,
     rejected: candidates.length - valid.length,
     rejectRatio,
@@ -817,7 +820,12 @@ function getAllSessionsDetailed() {
     // A transcript this badly damaged is excluded wholesale: its surviving
     // sessions are as likely to be artefacts as the rejected ones, and serving
     // them lets one bad entry contribute as much practice as a clean one.
-    if (rec.rejectRatio > TUNING.MAX_ENTRY_REJECT_RATIO) {
+    //
+    // A clip transcript is exempt: the window is short, so one awkward
+    // boundary can push the reject ratio far past the gate even though the
+    // per-session checks still filter every object it would serve. Dropping
+    // the entry would throw away the whole paid window instead.
+    if (!rec.partial && rec.rejectRatio > TUNING.MAX_ENTRY_REJECT_RATIO) {
       console.warn(
         `dictation: excluding ${e.id} — ${(rec.rejectRatio * 100).toFixed(0)}% of ` +
         `${rec.candidates} candidates rejected`,
@@ -1461,4 +1469,6 @@ module.exports = {
   getSessionById,
   getSessionContext,
   gradeDictation,
+  // Used by backend/clip.js to trim a clip to whole sentences.
+  endsUnit,
 };

@@ -98,6 +98,34 @@ NewsHour episode. Preview a run with `node backend/pbs-sync.js --dry-run`.
 `main.js` is the Electron shell. Avoid changing `app-player.js`'s explanation
 engine unless the task requires it.
 
+### Transcribing only a clip of each segment
+
+Azure bills STT by the second of audio sent, so `pbs-sync` no longer uploads
+whole segments. Each segment is sent as one random clip: **50 s for a
+Monday–Thursday episode, 100 s for Friday's** (Friday's episode has to cover
+Saturday, Sunday and Monday). The clip is saved on the entry as `sttClip`
+before the call and repairs re-send exactly the same bytes; the response's word
+times are shifted back to file time and trimmed to whole sentences, because
+session ids are word indexes and an entry's stored words can never change once
+practice starts. Frame walking and window selection live in `backend/clip.js`;
+a file that cannot be walked is marked `sttGaveUp` with reason
+`clip_unsupported` and is never sent whole.
+
+An entry gets at most **three sync-level attempts** (`sttAttempts`). A permanent
+failure — Azure's `azure returned no transcript`, or an `azureStatus` of 4xx
+other than 401/403/408/429 — gives up at once; an ai-service that is not
+running (`ECONNREFUSED`) is free, does not count, and is tried again next sync.
+`sttGaveUp` makes the repair pass skip the entry, so a dead job is not paid for
+forever. A given-up entry is deleted with its day.
+
+Every HTTP request to ai-service is appended to
+`<library>/stt-usage.jsonl` (`seconds` = exact audio seconds sent). The monthly
+total, for the packaged Linux library:
+
+```
+grep '"at":"2026-11' ~/.config/daily-dictation/library/stt-usage.jsonl | grep -oE '"seconds":[0-9.]+' | cut -d: -f2 | awk '{s+=$1;n++} END {printf "%d calls, %.0f s, %.3f h\n", n, s, s/3600}'
+```
+
 ## Packaging
 
 ### CI/CD (GitHub Actions, same pattern as ~/source-viewer)
