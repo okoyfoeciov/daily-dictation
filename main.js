@@ -12,6 +12,27 @@ const backend = require("./backend/server");
 // the one and only page this app loads at all.
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 
+// Linux: keep Chromium from exporting this app's media playback over MPRIS.
+//
+// mic.js autoplays each recorded clip as soon as its transcript arrives. That
+// clip is a MediaRecorder WebM with no duration header, so Chromium reports
+// mpris:length as INT64_MAX and GNOME Shell re-reads the whole metadata
+// dictionary on every position update (about ten times a second while the clip
+// plays). Each read logs "Value 9223372036854775807 cannot be safely stored in
+// a JS Number", and media-aware shell extensions re-render their controller on
+// every one of those updates. Measured on 2026-10-24: 2814 of those lines in
+// one mic session, followed by the shell missing key-repeat deadlines and the
+// whole desktop freezing. This app has no OS media-key/media-control feature,
+// so the MPRIS bridge is pure overhead here; disabling it leaves <audio>
+// playback untouched. Keep any --disable-features value already supplied.
+const disabledFeatures = app.commandLine.getSwitchValue("disable-features");
+if (process.platform === "linux") {
+  app.commandLine.appendSwitch(
+    "disable-features",
+    [disabledFeatures, "MediaSessionService"].filter(Boolean).join(","),
+  );
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1280,
