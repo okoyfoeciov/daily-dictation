@@ -1,7 +1,9 @@
 // mic.js — the floating microphone button: press to record, press again to
 // stop and transcribe. The transcript opens in a draggable card with a player
 // so you can hear what you said while you read it, and the text is copied to
-// your clipboard automatically.
+// your clipboard automatically. The card's "Insert and check" button hands the
+// transcript to app-dictation.js, which replaces the notepad answer with it and
+// runs the checker.
 //
 // This page IS the app's own origin, so the microphone is requested and held
 // right here and the recorded clip plays from a real <audio> element.
@@ -128,24 +130,21 @@
 
   const actions = document.createElement("div");
   actions.className = "mic-actions";
-  const copyBtn = document.createElement("button");
-  copyBtn.type = "button";
-  copyBtn.className = "mic-copy";
-  copyBtn.setAttribute("aria-label", "Copy");
-  const cpIco = svg([
-    { t: "rect", x: "9", y: "9", width: "11", height: "11", rx: "2" },
-    { t: "path", d: "M5 15V6a2 2 0 0 1 2-2h8" },
-  ], "mic-ico-cp");
+  const insertBtn = document.createElement("button");
+  insertBtn.type = "button";
+  insertBtn.className = "mic-insert";
+  insertBtn.setAttribute("aria-label", "Insert and check");
+  insertBtn.title = "Replace the answer with this transcript and check it";
   const ckIco = svg([{ t: "path", d: "M20 6 9 17l-5-5" }], "mic-ico-ck");
-  for (const s of [cpIco, ckIco]) {
-    s.setAttribute("fill", "none");
-    s.setAttribute("stroke", "currentColor");
-    s.setAttribute("stroke-width", "2");
-    s.setAttribute("stroke-linecap", "round");
-    s.setAttribute("stroke-linejoin", "round");
-  }
-  copyBtn.append(cpIco, ckIco);
-  actions.appendChild(copyBtn);
+  ckIco.setAttribute("fill", "none");
+  ckIco.setAttribute("stroke", "currentColor");
+  ckIco.setAttribute("stroke-width", "2");
+  ckIco.setAttribute("stroke-linecap", "round");
+  ckIco.setAttribute("stroke-linejoin", "round");
+  const insertLabel = document.createElement("span");
+  insertLabel.textContent = "Insert and check";
+  insertBtn.append(ckIco, insertLabel);
+  actions.appendChild(insertBtn);
   body.append(textEl, player, audioEl, actions);
   card.append(grip, body);
   modal.append(backdrop, card);
@@ -285,7 +284,8 @@
   function showTranscript(t, dur) {
     textEl.textContent = t || "No speech detected";
     textEl.classList.toggle("mic-empty", !t);
-    copyBtn.hidden = !t;
+    insertBtn.hidden = !t;
+    insertBtn.disabled = false;
     card.style.transform = "";
     dx = dy = 0;
     player.hidden = false;
@@ -311,9 +311,6 @@
       textEl.textContent = "";
       textEl.classList.remove("mic-empty");
       dropSelection();
-      clearTimeout(copiedTimer);
-      copyBtn.classList.remove("mic-copied");
-      copyBtn.setAttribute("aria-label", "Copy");
     }, 240);
   }
 
@@ -486,21 +483,19 @@
     // transcribing: a request is already in flight, so the click is ignored.
   });
 
-  let copiedTimer = 0;
-  copyBtn.addEventListener("click", (e) => {
+  insertBtn.addEventListener("click", (e) => {
     if (!e.isTrusted) return;
-    const done = () => {
-      copyBtn.classList.add("mic-copied");
-      copyBtn.setAttribute("aria-label", "Copied");
-      clearTimeout(copiedTimer);
-      copiedTimer = setTimeout(() => {
-        copyBtn.classList.remove("mic-copied");
-        copyBtn.setAttribute("aria-label", "Copy");
-      }, 1500);
-    };
-    if (navigator.clipboard) navigator.clipboard.writeText(textEl.textContent).then(done, selectText);
-    else selectText();
-    copyBtn.blur();
+    const t = textEl.textContent;
+    if (!t || typeof window.__dictationInsertAndCheck !== "function") return;
+    // The card has no checker of its own; app-dictation.js owns the notepad and
+    // grades the text. It returns false when there is no active session, in
+    // which case the card stays open rather than throwing the transcript away.
+    if (window.__dictationInsertAndCheck(t) === false) return;
+    // The card stays clickable for the 240ms fade; without this a double-click
+    // would replace the answer and start a second check.
+    insertBtn.disabled = true;
+    insertBtn.blur();
+    closeModal();
   });
 
   function dropSelection() {
@@ -508,16 +503,6 @@
       const sel = getSelection();
       if (!sel || !sel.rangeCount) return;
       if (card.contains(sel.getRangeAt(0).commonAncestorContainer)) sel.removeAllRanges();
-    } catch (_) {}
-  }
-
-  function selectText() {
-    try {
-      const range = document.createRange();
-      range.selectNodeContents(textEl);
-      const sel = getSelection();
-      sel.removeAllRanges();
-      sel.addRange(range);
     } catch (_) {}
   }
 

@@ -756,6 +756,19 @@
     }
   }
 
+  // Called from the microphone transcript card (mic.js): replace the notepad's
+  // answer with the dictated text and grade it. Returns false when there is no
+  // session to check against, so the card keeps the transcript instead of
+  // closing on a no-op.
+  function insertAndCheck(text) {
+    const t = String(text || "").trim();
+    if (!currentSession || !t) return false;
+    dictInput.value = t;
+    dictInput.focus();
+    checkCurrent();
+    return true;
+  }
+
   async function completeAndNext() {
     // Clear grading numbers instantly on Next — don't wait for /complete or
     // /session round-trips (previous behavior kept 85% / WER visible until
@@ -1073,12 +1086,16 @@
   pollSyncStatus();
   setInterval(pollSyncStatus, 10000);
 
+  // The mic transcript card's "Insert and check" entry point (see mic.js).
+  window.__dictationInsertAndCheck = insertAndCheck;
+
   // Expose for console debugging
   window.__dictation = {
     get session() { return currentSession; },
     get abLoop() { return abStart == null ? null : { start: abStart, end: abEnd }; },
     loadNextSession,
     checkCurrent,
+    insertAndCheck,
     completeAndNext,
   };
 })();

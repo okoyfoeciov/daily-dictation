@@ -1104,8 +1104,10 @@
 <!-- Transport + explanation panel: the shared <audio> player bar and the
      word/phrase explanation engine dictation looks words up in. -->
 <script src="app-player.js"></script>
-<!-- The floating microphone button — see mic.js's own header. Depends only on
-     app-base.js's apiBase(). -->
+<!-- The floating microphone button — see mic.js's own header. Uses
+     app-base.js's apiBase() for transcription and app-dictation.js's
+     window.__dictationInsertAndCheck bridge (loaded below) for the card's
+     "Insert and check" action. -->
 <script src="mic.js"></script>
 <!-- Daily Dictation — audio-only 1–2 sentence loops from PBS NewsHour,
      with a WER-based checker. See backend/dictation.js for the scoring
