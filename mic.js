@@ -130,21 +130,42 @@
 
   const actions = document.createElement("div");
   actions.className = "mic-actions";
+
   const insertBtn = document.createElement("button");
   insertBtn.type = "button";
   insertBtn.className = "mic-insert";
   insertBtn.setAttribute("aria-label", "Insert and check");
-  insertBtn.title = "Replace the answer with this transcript and check it";
+  insertBtn.title = "Insert this transcript and check it";
+  const insertIco = svg([
+    { t: "rect", x: "8", y: "2", width: "8", height: "4", rx: "1" },
+    { t: "path", d: "M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" },
+    { t: "path", d: "m9 14 2 2 4-4" },
+  ], "mic-ico-insert");
+  insertIco.setAttribute("fill", "none");
+  insertIco.setAttribute("stroke", "currentColor");
+  insertIco.setAttribute("stroke-width", "2");
+  insertIco.setAttribute("stroke-linecap", "round");
+  insertIco.setAttribute("stroke-linejoin", "round");
+  insertBtn.appendChild(insertIco);
+
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "mic-copy";
+  copyBtn.setAttribute("aria-label", "Copy");
+  const cpIco = svg([
+    { t: "rect", x: "9", y: "9", width: "11", height: "11", rx: "2" },
+    { t: "path", d: "M5 15V6a2 2 0 0 1 2-2h8" },
+  ], "mic-ico-cp");
   const ckIco = svg([{ t: "path", d: "M20 6 9 17l-5-5" }], "mic-ico-ck");
-  ckIco.setAttribute("fill", "none");
-  ckIco.setAttribute("stroke", "currentColor");
-  ckIco.setAttribute("stroke-width", "2");
-  ckIco.setAttribute("stroke-linecap", "round");
-  ckIco.setAttribute("stroke-linejoin", "round");
-  const insertLabel = document.createElement("span");
-  insertLabel.textContent = "Insert and check";
-  insertBtn.append(ckIco, insertLabel);
-  actions.appendChild(insertBtn);
+  for (const s of [cpIco, ckIco]) {
+    s.setAttribute("fill", "none");
+    s.setAttribute("stroke", "currentColor");
+    s.setAttribute("stroke-width", "2");
+    s.setAttribute("stroke-linecap", "round");
+    s.setAttribute("stroke-linejoin", "round");
+  }
+  copyBtn.append(cpIco, ckIco);
+  actions.append(insertBtn, copyBtn);
   body.append(textEl, player, audioEl, actions);
   card.append(grip, body);
   modal.append(backdrop, card);
@@ -286,6 +307,7 @@
     textEl.classList.toggle("mic-empty", !t);
     insertBtn.hidden = !t;
     insertBtn.disabled = false;
+    copyBtn.hidden = !t;
     card.style.transform = "";
     dx = dy = 0;
     player.hidden = false;
@@ -311,6 +333,9 @@
       textEl.textContent = "";
       textEl.classList.remove("mic-empty");
       dropSelection();
+      clearTimeout(copiedTimer);
+      copyBtn.classList.remove("mic-copied");
+      copyBtn.setAttribute("aria-label", "Copy");
     }, 240);
   }
 
@@ -498,11 +523,38 @@
     closeModal();
   });
 
+  let copiedTimer = 0;
+  copyBtn.addEventListener("click", (e) => {
+    if (!e.isTrusted) return;
+    const done = () => {
+      copyBtn.classList.add("mic-copied");
+      copyBtn.setAttribute("aria-label", "Copied");
+      clearTimeout(copiedTimer);
+      copiedTimer = setTimeout(() => {
+        copyBtn.classList.remove("mic-copied");
+        copyBtn.setAttribute("aria-label", "Copy");
+      }, 1500);
+    };
+    if (navigator.clipboard) navigator.clipboard.writeText(textEl.textContent).then(done, selectText);
+    else selectText();
+    copyBtn.blur();
+  });
+
   function dropSelection() {
     try {
       const sel = getSelection();
       if (!sel || !sel.rangeCount) return;
       if (card.contains(sel.getRangeAt(0).commonAncestorContainer)) sel.removeAllRanges();
+    } catch (_) {}
+  }
+
+  function selectText() {
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(textEl);
+      const sel = getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
     } catch (_) {}
   }
 
