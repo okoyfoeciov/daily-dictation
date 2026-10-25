@@ -98,20 +98,29 @@ app.get("/api/dictation/stats", (req, res) => {
 
 app.get("/api/dictation/session", (req, res) => {
   try {
-    const pick = dictation.pickNextSession();
-    if (!pick) return res.status(404).json({ error: "No dictation sessions available." });
-    // An empty pool is a STATE, not an error: a learner who has mastered the
-    // corpus must see their totals, not the same blank screen an unreachable
-    // backend produces. 404 here erased the progress panel at exactly the moment
-    // it was most worth showing.
-    if (!pick.session) {
-      return res.json({
-        session: null,
-        exhausted: true,
-        stats: dictation.getProgress(),
-      });
+    // Resume is a UI hint, not scheduler state: honor it only when that exact
+    // session is still in the current corpus. A pruned or re-segmented ID falls
+    // through to the normal draw, so a stale hint can never wedge the app on a
+    // session that no longer exists.
+    const resumeId = typeof req.query.resume === "string" ? req.query.resume.trim() : "";
+    let s = resumeId ? dictation.getSessionById(resumeId) : null;
+    let pick = null;
+    if (!s) {
+      pick = dictation.pickNextSession();
+      if (!pick) return res.status(404).json({ error: "No dictation sessions available." });
+      // An empty pool is a STATE, not an error: a learner who has mastered the
+      // corpus must see their totals, not the same blank screen an unreachable
+      // backend produces. 404 here erased the progress panel at exactly the moment
+      // it was most worth showing.
+      if (!pick.session) {
+        return res.json({
+          session: null,
+          exhausted: true,
+          stats: dictation.getProgress(),
+        });
+      }
+      s = pick.session;
     }
-    const s = pick.session;
     // Surrounding sessions' texts (same entry, one per side when they exist)
     // so a word lookup can send the LLM more than the current 1-2 sentences.
     // The client marks which span the click came from; never crossing entries.
@@ -142,14 +151,14 @@ app.get("/api/dictation/session", (req, res) => {
       reference: s.text,
       contextBefore,
       contextAfter,
-      exhausted: pick.exhausted,
-      stats: {
+      exhausted: pick ? pick.exhausted : false,
+      stats: pick ? {
         total: pick.total,
         remaining: pick.remaining,
         unseen: pick.unseen,
         due: pick.due,
         retired: pick.retired,
-      },
+      } : dictation.getProgress(),
     });
   } catch (e) {
     console.error("dictation session error", e);

@@ -77,6 +77,21 @@
   const DICT_RATE_MIN = 0.6, DICT_RATE_MAX = 1.0;
   let dictRate = 1.0;
 
+  // The session currently on screen, so closing and reopening the app returns
+  // to it instead of drawing a fresh one. This is UI state only: the scheduler's
+  // progress stays in dictation.json, and the backend silently falls back to a
+  // normal pick if the saved ID was pruned or re-segmented.
+  const LS_DICT_SESSION = "av-dictation-session";
+  function readLastSessionId() {
+    try { return localStorage.getItem(LS_DICT_SESSION) || ""; } catch { return ""; }
+  }
+  function rememberSession(sessionId) {
+    try {
+      if (sessionId) localStorage.setItem(LS_DICT_SESSION, sessionId);
+      else localStorage.removeItem(LS_DICT_SESSION);
+    } catch {}
+  }
+
   // Continuous loop over the segment, off by default. The segment otherwise
   // plays once and stops (6da3781); this makes repeating it a toggle rather
   // than a click per repetition. Per session, NOT persisted: looping is what
@@ -370,7 +385,7 @@
   // on its own. The learner decides when to listen — pressing Next while reading
   // the previous answer used to blast the next clip immediately. Callers that
   // genuinely want playback pass autoplay: true.
-  async function loadNextSession({ autoplay = false } = {}) {
+  async function loadNextSession({ autoplay = false, resumeId = "" } = {}) {
     dictCheckBtn.disabled = true;
     dictNextBtn.disabled = true;
     dictResultEl.hidden = true;
@@ -389,7 +404,10 @@
     setDictLoop(false);
 
     try {
-      const r = await fetch(apiBase() + "/api/dictation/session");
+      const resume = String(resumeId || "").trim();
+      const url = apiBase() + "/api/dictation/session" +
+        (resume ? "?resume=" + encodeURIComponent(resume) : "");
+      const r = await fetch(url);
       if (!r.ok) {
         const j = await r.json().catch(() => ({}));
         throw new Error(j.error || `HTTP ${r.status}`);
@@ -400,6 +418,7 @@
       // screen, which is what an unreachable backend looks like.
       if (!data.sessionId) {
         currentSession = null;
+        rememberSession("");
         showDictEmpty("All sessions mastered — nothing due right now.");
         if (data.stats) renderDictStats(data.stats);
         dictNextBtn.disabled = false;
@@ -429,6 +448,7 @@
           end: Number(w.end) || Number(w.start) || 0,
         })) : [],
       };
+      rememberSession(currentSession.sessionId);
       // Update header
       dictTitleEl.textContent = currentSession.entryTitle || currentSession.entryId;
       dictTitleEl.title = currentSession.entryTitle || "";
@@ -780,6 +800,10 @@
     // permanent and depresses the item's novelty score for good.
     if (dictNextBtn.disabled) return;
     dictNextBtn.disabled = true;
+    // Next ends this session deliberately. Clear the resume hint now, not after
+    // the /complete round trip: a quit in that window must not reopen a session
+    // the learner has already moved on from.
+    rememberSession("");
 
     const scoreToSave = lastGrade && typeof lastGrade.score === "number" ? lastGrade.score : null;
     // Captured here because the reset below runs before the attempt is posted.
@@ -836,7 +860,8 @@
   if (dictNextBtn) dictNextBtn.addEventListener("click", completeAndNext);
   // Wrapped, not passed directly: as a listener it would receive the click Event
   // as its options object and read autoplay off it.
-  if (dictRetryBtn) dictRetryBtn.addEventListener("click", () => loadNextSession());
+  if (dictRetryBtn) dictRetryBtn.addEventListener("click", () =>
+    loadNextSession({ resumeId: readLastSessionId() }));
 
   // Explanation lookup on the Reference line: left-CLICK a word, or left-DRAG
   // across several to ask about the whole phrase. Driven off
@@ -1082,7 +1107,7 @@
 
   initDictationView();
   refreshDictationView();
-  loadNextSession({ autoplay: false });
+  loadNextSession({ autoplay: false, resumeId: readLastSessionId() });
   pollSyncStatus();
   setInterval(pollSyncStatus, 10000);
 
