@@ -10,6 +10,8 @@
 // Reached at the loopback URL app-base.js resolves.
 
 const fs = require("fs");
+const http = require("http");
+const net = require("net");
 const express = require("express");
 const db = require("./db");
 const paths = require("./paths");
@@ -53,23 +55,38 @@ app.all(EXPLAIN_PATHS, express.raw({ type: () => true, limit: "10mb" }), async (
   }
 });
 
-// The floating microphone button's connection warm-up (mic.js). ai-service
-// no-ops this unless AssemblyAI is the selected provider; forwarding it costs
-// nothing for the others and keeps the renderer off the ai-service address.
-app.get("/api/transcribe/warm", async (req, res) => {
-  try {
-    const upstream = await fetch(`${AI_SERVICE_BASE}/api/transcribe/warm`);
-    res.status(upstream.status).end();
-  } catch {
-    res.status(502).end();
-  }
+// The floating microphone button's streaming transcription (mic.js). The
+// request body is the still-recording MediaRecorder stream; this pipe keeps it
+// streaming all the way to ai-service, and the response comes back only after
+// the body ends. No body parser on this route.
+app.post("/api/transcribe/stream", (req, res) => {
+  const url = new URL(`${AI_SERVICE_BASE}/api/transcribe/stream`);
+  const upstream = http.request({
+    hostname: url.hostname,
+    port: url.port || 80,
+    path: url.pathname,
+    method: "POST",
+    headers: { "Content-Type": req.get("Content-Type") || "audio/webm" },
+  }, (up) => {
+    res.writeHead(up.statusCode || 502, {
+      "Content-Type": up.headers["content-type"] || "application/json",
+    });
+    up.pipe(res);
+  });
+  upstream.on("error", () => {
+    if (!res.headersSent) {
+      res.status(502).json({ error: "Could not reach the transcription service." });
+    } else {
+      res.destroy();
+    }
+  });
+  req.on("aborted", () => upstream.destroy());
+  res.on("close", () => upstream.destroy());
+  req.pipe(upstream);
 });
 
-// The floating microphone button's transcription call (mic.js) — a single
-// short recording POSTed as a raw audio blob, proxied straight through to
-// ai-service's own /api/transcribe (a one-shot short-clip endpoint, capped
-// client-side at 60s). Raw body passthrough, same shape as the EXPLAIN_PATHS
-// proxy above, sized for a ~60s opus clip (well under 1MB) with headroom.
+// The batch transcription proxy, kept for older callers. The current floating
+// microphone streams through /api/transcribe/stream above instead.
 app.post("/api/transcribe", express.raw({ type: () => true, limit: "20mb" }), async (req, res) => {
   try {
     const upstream = await fetch(`${AI_SERVICE_BASE}/api/transcribe`, {
@@ -307,6 +324,32 @@ app.get("/api/library/:id/stream", (req, res) => {
 let server = null;
 let livePort = null;
 
+// A raw WebSocket tunnel to ai-service. The browser sends MediaRecorder chunks
+// over /api/transcribe/ws; this pipes the HTTP Upgrade and every frame straight
+// through, so the renderer still never talks to ai-service itself.
+function proxyTranscribeWS(req, socket, head) {
+  if (!req.url.startsWith("/api/transcribe/ws")) {
+    socket.destroy();
+    return;
+  }
+  const target = new URL(AI_SERVICE_BASE);
+  const port = target.port || 80;
+  const upstream = net.connect(Number(port), target.hostname, () => {
+    let raw = `${req.method} ${req.url} HTTP/1.1\r\n`;
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const k = req.rawHeaders[i];
+      const v = k.toLowerCase() === "host" ? target.host : req.rawHeaders[i + 1];
+      raw += `${k}: ${v}\r\n`;
+    }
+    raw += "\r\n";
+    upstream.write(raw);
+    if (head && head.length) upstream.write(head);
+    socket.pipe(upstream).pipe(socket);
+  });
+  upstream.on("error", () => socket.destroy());
+  socket.on("error", () => upstream.destroy());
+}
+
 function start({ port = DEFAULT_PORT, libraryDir = null } = {}) {
   if (libraryDir) paths.setLibraryDir(libraryDir);
   if (server && livePort === port) return Promise.resolve(server);
@@ -314,6 +357,7 @@ function start({ port = DEFAULT_PORT, libraryDir = null } = {}) {
     const s = app.listen(port, "127.0.0.1", () => {
       server = s;
       livePort = port;
+      s.on("upgrade", proxyTranscribeWS);
       console.log(`daily-dictation backend listening on http://127.0.0.1:${port}`);
       // Catch-up check: shortly after boot, then on a timer while the app runs.
       clearTimeout(syncStartTimer);

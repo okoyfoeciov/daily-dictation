@@ -8,10 +8,10 @@
 // This page IS the app's own origin, so the microphone is requested and held
 // right here and the recorded clip plays from a real <audio> element.
 //
-// The transcription endpoint is this app's own backend, which proxies
-// /api/transcribe straight through to ai-service — so the response
-// shape (including a failed transcription's detail) is ai-service's, and
-// failMessage() below maps it.
+// The transcription endpoint is this app's own backend, which proxies the
+// WebSocket at /api/transcribe/ws straight through to ai-service while the
+// recording runs — so the response shape (including a failed transcription's
+// detail) is ai-service's, and failMessage() below maps it.
 
 (() => {
   "use strict";
@@ -196,6 +196,13 @@
   let clipUrl = null;
   let clipMs = 0;
 
+  // The streaming transcription socket, open for the whole recording.
+  let streamSocket = null;
+  let streamOpen = null;
+  let streamPending = [];
+  let streamChain = Promise.resolve();
+  let streamResult = null;
+
   function setState(s) {
     state = s;
     root.dataset.state = s === "recording" ? "recording" : s === "transcribing" ? "transcribing" : "idle";
@@ -352,17 +359,80 @@
     return "";
   }
 
-  // Fire-and-forget. ai-service no-ops this for Groq and OpenRouter MAI; for
-  // AssemblyAI it opens the HTTPS connection while the user is speaking, so
-  // the transcription POST does not pay DNS/TCP/TLS setup after the stop.
-  function warmTranscriber() {
-    fetch(window.apiBase() + "/api/transcribe/warm", { method: "GET" })
-      .catch(() => { /* an optimisation must never fail a recording */ });
+  // One streaming socket per recording. The backend proxies it to ai-service;
+  // the text "stop" frame is the finish signal.
+  function startTranscriptionStream(mime) {
+    streamChain = Promise.resolve();
+    streamPending = [];
+    let openResolve, openReject;
+    streamOpen = new Promise((resolve, reject) => {
+      openResolve = resolve;
+      openReject = reject;
+    });
+    streamOpen.catch(() => {});     // handled; the stop path still sees it
+    streamResult = new Promise((resolve) => {
+      let settled = false;
+      const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
+      let ws;
+      try {
+        ws = new WebSocket(window.apiBase().replace(/^http/, "ws") +
+                           "/api/transcribe/ws?type=" +
+                           encodeURIComponent(mime || "audio/webm"));
+      } catch (err) {
+        openReject(err);
+        finish({ error: err });
+        return;
+      }
+      streamSocket = ws;
+      ws.binaryType = "arraybuffer";
+      ws.onopen = () => {
+        streamPending.forEach((b) => ws.send(b));
+        streamPending = [];
+        openResolve(true);
+      };
+      ws.onmessage = (e) => {
+        let data = {};
+        try { data = JSON.parse(e.data); } catch (_) { /* non-JSON error body */ }
+        if (data && data.error) {
+          finish({ ok: false, status: 502, data });
+          return;
+        }
+        finish({ ok: true, status: 200, data });
+      };
+      ws.onerror = () => {
+        const err = new Error("transcription connection failed");
+        openReject(err);
+        finish({ error: err });
+      };
+      ws.onclose = () => {
+        const err = new Error("transcription connection closed");
+        openReject(err);
+        finish({ error: err });
+      };
+    });
+  }
+
+  function sendAudio(buf) {
+    if (streamSocket && streamSocket.readyState === WebSocket.OPEN) {
+      streamSocket.send(buf);
+    } else {
+      streamPending.push(buf);
+    }
+  }
+
+  function abortStream() {
+    streamPending = [];
+    if (streamSocket) {
+      try { streamSocket.close(); } catch (_) {}
+      streamSocket = null;
+    }
+    streamChain = Promise.resolve();
+    streamResult = null;
+    streamOpen = null;
   }
 
   function startRecording() {
     dropClip();
-    warmTranscriber();
     chunks = [];
     recMime = pickMime();
     const opts = { audioBitsPerSecond: 128000 };
@@ -370,9 +440,19 @@
     try { recorder = new MediaRecorder(stream, opts); }
     catch (_) { recorder = new MediaRecorder(stream); }
     recMime = recorder.mimeType || recMime || "audio/webm";
-    recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+    recorder.ondataavailable = (e) => {
+      if (!e.data || !e.data.size) return;
+      chunks.push(e.data);
+      const blob = e.data;
+      streamChain = streamChain.then(() => blob.arrayBuffer()).then((buf) => {
+        sendAudio(buf);
+      }).catch((err) => {
+        console.error("[mic] stream chunk failed:", err && err.message);
+      });
+    };
     recorder.onstop = finish;
-    recorder.start();
+    startTranscriptionStream(recMime);
+    recorder.start(100);
     setState("recording");
     startTicking(Date.now());
   }
@@ -392,6 +472,7 @@
   function discard(reason) {
     if (state !== "recording") return;
     stopTicking();
+    abortStream();
     if (recorder) {
       recorder.ondataavailable = null;
       recorder.onstop = null;
@@ -414,6 +495,7 @@
     chunks = [];
 
     if (elapsed < MIN_RECORD_MS || blob.size < MIN_RECORD_BYTES) {
+      abortStream();
       setState("idle");
       idleStatus();
       flash("Too short — try again", false);
@@ -421,21 +503,25 @@
     }
 
     try {
-      const r = await fetch(window.apiBase() + "/api/transcribe", {
-        method: "POST",
-        headers: { "Content-Type": blob.type || "audio/webm" },
-        body: blob,
-      });
-      const raw = await r.text();
-      let data = {};
-      try { data = JSON.parse(raw); } catch (_) { /* non-JSON body */ }
-      if (!r.ok) {
+      await Promise.all([streamChain, streamOpen]);
+      if (!streamSocket || streamSocket.readyState !== WebSocket.OPEN) {
+        throw new Error("transcription connection closed");
+      }
+      streamPending.forEach((b) => streamSocket.send(b));
+      streamPending = [];
+      streamSocket.send("stop");
+      const res = await streamResult;
+      if (!res) throw new Error("no transcription response");
+      if (res.error) throw res.error;
+      if (!res.ok) {
         setState("idle");
         idleStatus();
-        setStatus(failMessage(r.status, data), true);
+        setStatus(res.data && res.data.error
+          ? "Transcription failed — " + res.data.error
+          : failMessage(res.status, res.data), true);
         return;
       }
-      const text = String(data.text || "").trim();
+      const text = String(res.data.text || "").trim();
       loadClip(blob, elapsed);
       setState("idle");
       idleStatus();
@@ -445,11 +531,18 @@
       setState("idle");
       idleStatus();
       setStatus("Transcription failed — " + (err && err.message || "no answer"), true);
+    } finally {
+      if (streamSocket) {
+        try { streamSocket.close(); } catch (_) {}
+      }
+      streamSocket = null;
+      streamOpen = null;
+      streamPending = [];
     }
   }
 
-  // The backend proxies straight through to ai-service's /api/transcribe, so the
-  // response shape (Groq status included) is ai-service's.
+  // The backend proxies straight through to ai-service's streaming route, so
+  // the response shape (Groq status included) is ai-service's.
   function failMessage(status, data) {
     const gs = data && data.groqStatus;
     let reason;

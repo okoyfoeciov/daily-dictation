@@ -4,8 +4,9 @@
 // Every apiBase() call site gets that prefixed: the dictation endpoints
 // (/api/dictation/*), the segment stream (/api/library/:id/stream), the
 // explanation/pronunciation/credit proxies (/api/explain, /api/pron,
-// /api/credits), and the mic transcription proxy (/api/transcribe). The
-// renderer never talks to ai-service or any other host directly.
+// /api/credits), and the mic transcription proxies (/api/transcribe/stream,
+// /api/transcribe/ws, /api/transcribe). The renderer never talks to ai-service
+// or any other host directly.
 
 (() => {
   "use strict";
