@@ -352,8 +352,17 @@
     return "";
   }
 
+  // Fire-and-forget. ai-service no-ops this for Groq and OpenRouter MAI; for
+  // AssemblyAI it opens the HTTPS connection while the user is speaking, so
+  // the transcription POST does not pay DNS/TCP/TLS setup after the stop.
+  function warmTranscriber() {
+    fetch(window.apiBase() + "/api/transcribe/warm", { method: "GET" })
+      .catch(() => { /* an optimisation must never fail a recording */ });
+  }
+
   function startRecording() {
     dropClip();
+    warmTranscriber();
     chunks = [];
     recMime = pickMime();
     const opts = { audioBitsPerSecond: 128000 };

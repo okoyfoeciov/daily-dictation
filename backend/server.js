@@ -53,6 +53,18 @@ app.all(EXPLAIN_PATHS, express.raw({ type: () => true, limit: "10mb" }), async (
   }
 });
 
+// The floating microphone button's connection warm-up (mic.js). ai-service
+// no-ops this unless AssemblyAI is the selected provider; forwarding it costs
+// nothing for the others and keeps the renderer off the ai-service address.
+app.get("/api/transcribe/warm", async (req, res) => {
+  try {
+    const upstream = await fetch(`${AI_SERVICE_BASE}/api/transcribe/warm`);
+    res.status(upstream.status).end();
+  } catch {
+    res.status(502).end();
+  }
+});
+
 // The floating microphone button's transcription call (mic.js) — a single
 // short recording POSTed as a raw audio blob, proxied straight through to
 // ai-service's own /api/transcribe (a one-shot short-clip endpoint, capped
