@@ -85,25 +85,6 @@ app.post("/api/transcribe/stream", (req, res) => {
   req.pipe(upstream);
 });
 
-// The batch transcription proxy, kept for older callers. The current floating
-// microphone streams through /api/transcribe/stream above instead.
-app.post("/api/transcribe", express.raw({ type: () => true, limit: "20mb" }), async (req, res) => {
-  try {
-    const upstream = await fetch(`${AI_SERVICE_BASE}/api/transcribe`, {
-      method: "POST",
-      headers: req.get("Content-Type") ? { "Content-Type": req.get("Content-Type") } : {},
-      body: req.body,
-    });
-    const buf = Buffer.from(await upstream.arrayBuffer());
-    res.status(upstream.status);
-    const ct = upstream.headers.get("content-type");
-    if (ct) res.setHeader("Content-Type", ct);
-    res.send(buf);
-  } catch {
-    res.status(502).json({ error: "Could not reach the transcription service." });
-  }
-});
-
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
