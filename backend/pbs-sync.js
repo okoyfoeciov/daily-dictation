@@ -24,7 +24,7 @@
 // Days beyond KEEP_DAYS, and weekend days, are pruned (entries + files).
 //
 // STT is paid by the second, so each segment is sent as one random short clip
-// (50 s for a Monday–Thursday episode, 100 s for Friday's), not whole; see
+// (35 s for a Monday–Thursday episode, 70 s for Friday's), not whole; see
 // backend/clip.js. The clip is saved on the entry before the call, and a repair
 // re-sends exactly the same bytes. An entry gets three attempts: a failure that
 // cannot succeed (Azure's "no transcript", or a 4xx other than 401/403/408/429)

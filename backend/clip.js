@@ -14,8 +14,8 @@
 // ending exactly at EOF. A file this cannot parse is not sent at all — there is
 // no fallback that would upload the whole segment.
 
-const CLIP_S_FRIDAY = 100;
-const CLIP_S_OTHER = 50;
+const CLIP_S_FRIDAY = 70;
+const CLIP_S_OTHER = 35;
 const PRE_PAD_FRAMES = 4;
 
 // dictation.js does not require this module, so this is a one-way dependency.
@@ -113,8 +113,13 @@ function walkFrames(buf) {
   };
 }
 
-// 100 s for a Friday episode (it has to cover Saturday, Sunday and Monday),
-// 50 s for every other weekday. The date is the collection's editorial day.
+// 70 s for a Friday episode (it has to cover Saturday, Sunday and Monday),
+// 35 s for every other weekday. The date is the collection's editorial day.
+//
+// A 35 s window leaves roughly 20–30 valid sessions per day after sentence
+// trimming and validation (~24 on the ten-segment October 28 episode), down
+// from ~43 at 50 s, and cuts the seconds sent to STT by 30%. Friday keeps twice
+// the window because that one episode is the whole weekend's material.
 function clipSecondsForDate(dateId) {
   const dow = new Date(`${dateId}T12:00:00Z`).getUTCDay();
   return dow === 5 ? CLIP_S_FRIDAY : CLIP_S_OTHER;
