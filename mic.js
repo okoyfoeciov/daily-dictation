@@ -3,7 +3,8 @@
 // so you can hear what you said while you read it, and the text is copied to
 // your clipboard automatically. The card's "Insert and check" button hands the
 // transcript to app-dictation.js, which replaces the notepad answer with it and
-// runs the checker.
+// runs the checker. That button stays disabled until the session on screen has
+// been revealed (a per-session gate reset by the next session).
 //
 // This page IS the app's own origin, so the microphone is requested and held
 // right here and the recorded clip plays from a real <audio> element.
@@ -309,11 +310,26 @@
     flash("Couldn't play the recording" + (err && err.code === 4 ? " (unsupported format)" : "") + ".", true);
   });
 
+  // "Insert and check" replaces the notepad answer, so it is gated on the
+  // current session having been revealed (app-dictation.js owns that state).
+  // The title says why it is unavailable, since a disabled icon alone does not.
+  function insertAllowed() {
+    const can = window.__dictationCanInsertAndCheck;
+    return typeof can === "function" && can() === true;
+  }
+  function syncInsertEnabled() {
+    const allowed = insertAllowed();
+    insertBtn.disabled = !allowed;
+    insertBtn.title = allowed
+      ? "Insert this transcript and check it"
+      : "Reveal the transcript first";
+  }
+
   function showTranscript(t, dur) {
     textEl.textContent = t || "No speech detected";
     textEl.classList.toggle("mic-empty", !t);
     insertBtn.hidden = !t;
-    insertBtn.disabled = false;
+    syncInsertEnabled();
     copyBtn.hidden = !t;
     card.style.transform = "";
     dx = dy = 0;
@@ -612,11 +628,15 @@
 
   insertBtn.addEventListener("click", (e) => {
     if (!e.isTrusted) return;
+    // The button is disabled until Reveal; re-check in case the session moved on
+    // between painting the card and the click.
+    if (!insertAllowed()) return;
     const t = textEl.textContent;
     if (!t || typeof window.__dictationInsertAndCheck !== "function") return;
     // The card has no checker of its own; app-dictation.js owns the notepad and
-    // grades the text. It returns false when there is no active session, in
-    // which case the card stays open rather than throwing the transcript away.
+    // grades the text. It returns false when there is no active session (or it
+    // is no longer revealed), in which case the card stays open rather than
+    // throwing the transcript away.
     if (window.__dictationInsertAndCheck(t) === false) return;
     // The card stays clickable for the 240ms fade; without this a double-click
     // would replace the answer and start a second check.

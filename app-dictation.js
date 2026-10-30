@@ -51,6 +51,11 @@
   let dictLoadSeq = 0;
   let lastGrade = null;
   let hasCheckedThisSession = false;
+  // Whether the learner has pressed Reveal for the session on screen. The mic
+  // card's Insert and check entry point stays disabled until this is true: it
+  // is a per-session gate, so loading another session (or restarting) closes it
+  // again.
+  let hasRevealedThisSession = false;
 
   // Dedicated dictation loop — independent from the A-B word loop's
   // loopStart/loopEnd so clicks that clear that loop never clear this one.
@@ -395,6 +400,7 @@
     closeExplanations();
     lastGrade = null;
     hasCheckedThisSession = false;
+    hasRevealedThisSession = false;
     dictInput.value = "";
     dictRevealBtn.hidden = true;
     // A new session starts with Loop off: the toggle belongs to the session it
@@ -729,6 +735,7 @@
   }
 
   function showRef() {
+    hasRevealedThisSession = true;
     showDictRef();
   }
 
@@ -778,15 +785,23 @@
 
   // Called from the microphone transcript card (mic.js): replace the notepad's
   // answer with the dictated text and grade it. Returns false when there is no
-  // session to check against, so the card keeps the transcript instead of
-  // closing on a no-op.
+  // session to check against, or when this session has not been revealed yet,
+  // so the card keeps the transcript instead of closing on a no-op. The card
+  // disables its button for the same reason (see canInsertAndCheck below); the
+  // check here keeps the rule true even if the button is clicked programmatically.
   function insertAndCheck(text) {
     const t = String(text || "").trim();
-    if (!currentSession || !t) return false;
+    if (!currentSession || !t || !hasRevealedThisSession) return false;
     dictInput.value = t;
     dictInput.focus();
     checkCurrent();
     return true;
+  }
+
+  // Whether the mic card may offer "Insert and check" right now. Read by
+  // mic.js when it paints the transcript card.
+  function canInsertAndCheck() {
+    return !!currentSession && hasRevealedThisSession;
   }
 
   async function completeAndNext() {
@@ -822,6 +837,7 @@
     closeExplanations();
     lastGrade = null;
     hasCheckedThisSession = false;
+    hasRevealedThisSession = false;
     // Loop off at click time, not after the /complete round trip below: the
     // segment must not keep repeating under an already-pressed Next.
     setDictLoop(false);
@@ -1113,11 +1129,13 @@
 
   // The mic transcript card's "Insert and check" entry point (see mic.js).
   window.__dictationInsertAndCheck = insertAndCheck;
+  window.__dictationCanInsertAndCheck = canInsertAndCheck;
 
   // Expose for console debugging
   window.__dictation = {
     get session() { return currentSession; },
     get abLoop() { return abStart == null ? null : { start: abStart, end: abEnd }; },
+    get revealed() { return hasRevealedThisSession; },
     loadNextSession,
     checkCurrent,
     insertAndCheck,
